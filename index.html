@@ -1,0 +1,1571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<!-- "Add to Home Screen" then launches it fullscreen, with no browser chrome -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Endless Ballz">
+<meta name="theme-color" content="#060607">
+<title>Endless Ballz</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #060607;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #wrap {
+    width: 100vw; height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background: #060607;
+  }
+  canvas {
+    background: #000;
+    display: block;
+    touch-action: none;
+    box-shadow: 0 0 60px rgba(255,90,20,0.08);
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+(function(){
+  "use strict";
+
+  // ---------- Canvas / responsive sizing ----------
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  const LW = 400, LH = 820; // logical design resolution
+  let scale = 1, dpr = Math.max(1, window.devicePixelRatio || 1);
+
+  function resize(){
+    const availW = window.innerWidth;
+    const availH = window.innerHeight;
+    scale = Math.min(availW / LW, availH / LH);
+    const cssW = LW * scale, cssH = LH * scale;
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function toLogical(clientX, clientY){
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) / (rect.width / LW),
+      y: (clientY - rect.top) / (rect.height / LH)
+    };
+  }
+
+  // ---------- Layout ----------
+  const COLS = 7;
+  const BOARD_W = LW;
+  const BS = BOARD_W / COLS;           // block size
+  const HEADER_H = 108;                // score header
+  const TOP_Y = HEADER_H;              // ceiling of the play field
+  // The newest row spawns one block-height BELOW the ceiling, leaving a permanent
+  // open lane along the top that balls can fly through (and hit the top row from above),
+  // as long as they can find a gap in the stack to get up there.
+  const ROW_TOP = TOP_Y + BS;
+  const MAX_ROWS = 8;
+  const FLOOR_Y = ROW_TOP + MAX_ROWS * BS; // bottom of play field
+  const SHOOT_Y = FLOOR_Y;             // shooter sits on the floor line
+
+  // ---------- Persistence ----------
+  const LS_BEST = 'endlessBallz_best';
+  const LS_MUTE = 'endlessBallz_muted';
+  let best = parseInt(localStorage.getItem(LS_BEST) || '0', 10);
+  let muted = localStorage.getItem(LS_MUTE) === '1';
+
+  // ---------- Sound (tiny WebAudio beeps, no assets) ----------
+  let actx = null;
+  function ac(){
+    if (!actx){
+      try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){ actx = null; }
+    }
+    return actx;
+  }
+  function beep(freq, dur, type, vol){
+    if (muted) return;
+    const a = ac(); if (!a) return;
+    // iOS/Android start an AudioContext suspended until a real user gesture;
+    // every beep path here runs from a tap, so resume on the way through.
+    if (a.state === 'suspended' && a.resume) { try { a.resume(); } catch(e){} }
+    try{
+      const o = a.createOscillator();
+      const g = a.createGain();
+      o.type = type || 'sine';
+      o.frequency.value = freq;
+      g.gain.value = (vol==null?0.06:vol);
+      o.connect(g); g.connect(a.destination);
+      const t0 = a.currentTime;
+      g.gain.setValueAtTime(g.gain.value, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + (dur||0.08));
+      o.start(t0);
+      o.stop(t0 + (dur||0.08) + 0.02);
+    } catch(e){}
+  }
+  const sfx = {
+    wall: () => beep(220, 0.03, 'sine', 0.03),
+    hit: () => beep(520, 0.05, 'triangle', 0.05),
+    pickup: () => beep(980, 0.12, 'sine', 0.07),
+    launch: () => beep(340, 0.03, 'sine', 0.025),
+    gameover: () => beep(120, 0.5, 'sawtooth', 0.08),
+    row: () => beep(200, 0.07, 'sine', 0.04),
+    // celebration: pitch climbs with the tier so the cascade audibly escalates
+    combo: (tier) => {
+      const root = 523 * Math.pow(1.122, tier*2);
+      beep(root, 0.12, 'triangle', 0.07);
+      setTimeout(()=>beep(root*1.26, 0.14, 'triangle', 0.07), 70);
+      if (tier >= 2) setTimeout(()=>beep(root*1.5, 0.18, 'triangle', 0.07), 140);
+      if (tier >= 4) setTimeout(()=>beep(root*2, 0.22, 'triangle', 0.07), 210);
+    },
+    column: () => {
+      [0,1,2].forEach(i=>setTimeout(()=>beep(700+i*260, 0.1, 'square', 0.05), i*60));
+    },
+    perfect: () => {
+      [523,659,784,1046,1318,1568].forEach((f,i)=>setTimeout(()=>beep(f, 0.35, 'triangle', 0.09), i*95));
+    },
+    // FEATURE: dangerZone -- low double thump while the stack is on the death line
+    heartbeat: () => { beep(64, 0.16, 'sine', 0.11); setTimeout(()=>beep(52, 0.2, 'sine', 0.09), 165); },
+    // FEATURE: lastStand -- tense tick while one block survives
+    tick: () => beep(1500, 0.05, 'sine', 0.04),
+    clip: () => { beep(700,0.08,'sine',0.05); setTimeout(()=>beep(1050,0.12,'sine',0.05),80); }
+  };
+
+  // ---------- Game state ----------
+  let rows = [];         // array of {vals:[COLS]} oldest(index0, nearest floor) .. newest (top)
+  let round = 0;
+  let ballCount = 1;
+  let score = 0;
+  let shooterX = LW/2;
+
+  let balls = [];        // active flying balls {x,y,vx,vy}
+  let floaters = [];     // floating text popups
+
+  const BALL_R = 6.5;
+  const SPEED = 620;     // px/s
+  const FIRE_INTERVAL = 0.045; // s between successive ball launches
+
+  // ---- TUNABLES: fast-forward when a round drags on -------------------------
+  // Thresholds are in REAL seconds of watching, measured from the moment you shoot.
+  // The sim runs extra physics steps per frame, so collisions stay exact --
+  // it is genuinely 2x/3x/4x time, not a bigger velocity.
+  // Deliberately late: a volley bouncing for a while is part of the fun, this
+  // only exists so it never feels like it is taking forever. Double-tap during a
+  // volley to override manually at any time.
+  const SPEEDUP_2X = 12;   // after this long -> double speed
+  const SPEEDUP_3X = 22;   // -> triple speed
+  const SPEEDUP_4X = 34;   // -> quadruple (set very high to disable this tier)
+  // Anti-stall net: after this long, a gentle downward pull drains the round.
+  const STALL_GRAVITY_AFTER = 32;
+  const STALL_GRAVITY = 110; // px/s^2
+
+  // ---- TUNABLES: the lucky "straight line" shot ---------------------------
+  // A perfectly straight line only locks in HUGGING A SIDE WALL -- that is the one
+  // place the reference game parks a ball bouncing up and down for a long time.
+  // Everywhere else a near-straight ball keeps its slight drift, bounces back and
+  // forth while creeping up or down, and eventually clips a corner away. That
+  // reads as real physics; snapping mid-board reads as fake.
+  const CORNER_SNAP_TOL = 0.15;   // how close to vertical a corner clip must be
+  const WALL_PARK_TOL   = 0.08;   // how close to vertical a wall bounce must be (~4.5 deg)
+  const WALL_HUG_DIST   = 20;     // px from a side wall that counts as "against the wall"
+  const ALLOW_SIDEWINDER = false; // perfect horizontal runs -- off; they look artificial
+
+  // ==========================================================================
+  // OPTIONAL FEATURES -- virality + suspense layer.
+  // Set any of these to false to switch that feature off completely; the game
+  // underneath is untouched. Each one also lives in its own block marked
+  // "FEATURE: <name>" so it can be deleted outright instead.
+  // ==========================================================================
+  const FEATURES = {
+    scoreTicker:  true,   // score spins up instead of jumping (reads great on video)
+    ballTrails:   true,   // motion trails, so a big volley looks like fireworks
+    dangerZone:   false,  // VETOED -- death line, red panic state, heartbeat
+    lastStand:    true,   // "ONE LEFT" cliffhanger on the final block
+    clipRecorder: true    // auto-records big volleys and offers to save/share them
+  };
+
+  // FEATURE: clipRecorder settings
+  const CLIP_MIN_TIER  = 1;    // keep the clip from AWESOME CLEAR (13 blocks) up
+  const CLIP_ARM_BALLS = 6;    // don't bother recording tiny early volleys
+  const CLIP_TAIL      = 1.7;  // extra seconds recorded so the celebration lands
+  const CLIP_MAX_SECS  = 45;   // hard cap on a single clip
+  // Record a fixed-size downscaled mirror rather than the raw retina canvas: on a
+  // 3x phone that bitmap is 1170x2399, and encoding it live causes frame hitches.
+  const CLIP_W = 600, CLIP_H = 1230;  // same 400:820 aspect as the board
+
+  // FEATURE: ballTrails
+  const TRAIL_SAMPLES  = 7;
+
+  let firing = false;
+  let toFire = 0;
+  let fireTimer = 0;
+  let roundClock = 0;    // real seconds since the current volley started
+  let speedMult = 1;
+  let speedUpOn = localStorage.getItem('endlessBallz_speedup') !== '0';
+  let snapCount = 0;     // how many lucky straight-line shots have triggered
+
+  // ---- Celebration: escalating hype as one volley tears through the board ----
+  // Tiers fire the moment the count is reached, so a cascade escalates live
+  // instead of waiting for a summary at the end.
+  const COMBO_TIERS = [
+    { n: 8,  text: 'SWEET!',          color: '#ffb027', shake: 3.0 },
+    { n: 13, text: 'AWESOME CLEAR!',  color: '#ff8c1a', shake: 4.5 },
+    { n: 19, text: 'MASSIVE!!',       color: '#ff6a20', shake: 6.0 },
+    { n: 26, text: 'INSANE!!',        color: '#ff3d20', shake: 7.5 },
+    { n: 34, text: 'UNREAL!!!',       color: '#ff2b6a', shake: 9.0 },
+    { n: 43, text: 'LEGENDARY!!!',    color: '#c86bff', shake: 11.0 }
+  ];
+
+  const COLUMN_CLEAR_MIN = 3;   // column must have been this deep to be celebrated
+  const PERFECT_MIN_BOARD = 8;  // board must have held this many blocks for full euphoria
+  let volleyDestroyed = 0;
+  let volleyColumnsCleared = 0;
+  let volleyTier = -1;
+  let volleyColStart = [];      // blocks per column when the volley began
+  let volleyBoardStart = 0;     // total blocks when the volley began
+  let banner = null;      // {text, sub, color, life, maxLife, big}
+  let shake = 0;
+  let flash = null;       // {color, life, maxLife}
+  let rings = [];         // expanding celebration rings
+  let slowmo = 0;         // seconds of remaining slow motion
+  let slowmoFactor = 0.35;
+  let volleyPerfect = false;
+
+  // FEATURE: scoreTicker
+  let scoreShown = 0;
+  // FEATURE: dangerZone
+  let dangerBeat = 0;
+  // FEATURE: lastStand
+  let lastStandOn = false;
+  let lastStandTick = 0;
+  // FEATURE: clipRecorder
+  let recCanvas = null, recCtx = null;
+  let recStream = null, recorder = null, recChunks = [], recMime = '', recKeep = false;
+  let recStartedAt = 0, clipTail = -1, clipBlob = null, clipSecs = 0, clipReady = false;
+  let clipBtn = null;     // hit rect, set while the button is on screen
+
+  let aiming = false;
+  let aimDir = null; // {x,y} normalized
+  let pointerPos = null;
+  let lastTapAt = -1;
+  let manualMult = 0;     // 0 = automatic, otherwise a player-chosen multiplier
+
+  let state = 'playing'; // 'playing' | 'paused' | 'gameover'
+  let gameOverPulse = 0;
+  let hasShotOnce = false;
+
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function randInt(a,b){ return Math.floor(rand(a,b+1)); }
+
+  // Every block in a freshly spawned row shares one value, and that value climbs
+  // as the game goes on: 1, 2, 3, then +2 per row (5, 7, 9 ... 25, 27, 29).
+  function rowValueForRound(n){
+    return n <= 3 ? n : 2*n - 3;
+  }
+
+  // ---- How many blocks a new row arrives with --------------------------------
+  // 4-6 stays the common case because that is the pacing the game is tuned
+  // around. 7 is deliberately impossible: a full-width wall is a run ender.
+  // Sparse rows are the rare breather -- and an empty row is a free lane
+  // straight up into the top region, which is what makes a cascade possible.
+  const ROW_WEIGHTS = [
+    [0,  1.5],
+    [1,  1.5],
+    [2,  3.0],
+    [3,  5.0],
+    [4, 29.5],
+    [5, 30.0],
+    [6, 29.5]
+  ];
+  const ROW_WEIGHT_TOTAL = ROW_WEIGHTS.reduce((s,e)=>s+e[1], 0);
+  function pickBlockCount(){
+    if (round <= 2) return randInt(4,6);   // keep the opening rows readable
+    let r = Math.random() * ROW_WEIGHT_TOTAL;
+    for (const e of ROW_WEIGHTS){
+      r -= e[1];
+      if (r <= 0) return e[0];
+    }
+    return 5;
+  }
+
+  // Brightness is relative to the value the row spawned with: a fresh row always
+  // reads bright orange-red, and blocks darken toward deep maroon as they get worn down.
+  function valueColor(v, base){
+    const b = Math.max(1, base || v);
+    const t = Math.max(0.08, Math.min(1, v / b));
+    const hue = 8 + 20*t;
+    const light = 30 + 26*t;
+    return {
+      border: `hsl(${hue}, 92%, ${light}%)`,
+      fill: `hsla(${hue}, 92%, ${Math.max(12, light-20)}%, 0.30)`,
+      glow: `hsla(${hue}, 92%, ${light}%, ${0.18 + 0.5*t})`
+    };
+  }
+
+  function newRow(){
+    round++;
+    // one extra ball to shoot for every row that arrives
+    ballCount++;
+
+    const rowValue = rowValueForRound(round);
+    const vals = new Array(COLS).fill(0);
+
+    // shuffle the columns, then fill the first N of them
+    const order = [];
+    for (let c=0;c<COLS;c++) order.push(c);
+    for (let i=order.length-1;i>0;i--){
+      const j = randInt(0,i);
+      const t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+
+    const n = pickBlockCount();
+    for (let i=0;i<n;i++) vals[order[i]] = rowValue;
+
+    // A bonus pickup can sit in an empty cell, but only when a real gap is left
+    // over -- a row that looks solid wall-to-wall reads as a run ender even
+    // though balls pass straight through the orb.
+    const empties = order.slice(n);
+    if (empties.length >= 2 && Math.random() < 0.25){
+      vals[empties[0]] = -1;
+    }
+
+    rows.push({ vals, spawn: 0, base: rowValue });
+
+    // trim rows that overflow the floor
+    while (rows.length > MAX_ROWS){
+      const oldest = rows[0];
+      const hasBlock = oldest.vals.some(v => v > 0);
+      if (hasBlock){
+        triggerGameOver();
+        break;
+      } else {
+        rows.shift();
+      }
+    }
+  }
+
+  function rowY(rowIdx){
+    return ROW_TOP + (rows.length - 1 - rowIdx) * BS;
+  }
+
+  function resetGame(){
+    rows = [];
+    round = 0;
+    ballCount = 0;   // newRow() bumps this to 1 for the opening round
+    score = 0;
+    shooterX = LW/2;
+    balls = [];
+    floaters = [];
+    firing = false; toFire = 0; fireTimer = 0;
+    roundClock = 0; speedMult = 1; snapCount = 0;
+    volleyDestroyed = 0; volleyColumnsCleared = 0; volleyTier = -1;
+    banner = null; shake = 0; flash = null; rings = []; slowmo = 0;
+    manualMult = 0; lastTapAt = -1;
+    volleyPerfect = false; slowmoFactor = 0.35;
+    scoreShown = 0;                                    // FEATURE: scoreTicker
+    dangerBeat = 0;                                    // FEATURE: dangerZone
+    lastStandOn = false; lastStandTick = 0;            // FEATURE: lastStand
+    endClip(false); clipReady = false; clipBlob = null; clipBtn = null; // FEATURE: clipRecorder
+    aiming = false; aimDir = null;
+    state = 'playing';
+    gameOverPulse = 0;
+    hasShotOnce = false;
+    newRow();
+  }
+
+  function triggerGameOver(){
+    if (state === 'gameover') return;
+    state = 'gameover';
+    firing = false;
+    balls = [];
+    if (score > best){
+      best = score;
+      localStorage.setItem(LS_BEST, String(best));
+    }
+    sfx.gameover();
+  }
+
+  // ---------- Input ----------
+  const BTN_PAUSE = {x: LW-52, y: 20, w:36, h:36};
+  const BTN_MUTE  = {x: 16, y: 20, w:36, h:36};
+
+  function inRect(px,py,r){ return px>=r.x && px<=r.x+r.w && py>=r.y && py<=r.y+r.h; }
+
+  function computeAim(px, py){
+    let dx = px - shooterX;
+    let dy = py - SHOOT_Y;
+    let ang = Math.atan2(-dy, dx); // 0=right,90=up,180=left
+    const minA = 10 * Math.PI/180;
+    const maxA = 170 * Math.PI/180;
+    if (ang < minA) ang = minA;
+    if (ang > maxA) ang = maxA;
+    if (ang > Math.PI) ang = Math.PI - 0.001;
+    return { x: Math.cos(ang), y: -Math.sin(ang) };
+  }
+
+  function pointerDown(px,py){
+    if (state === 'paused'){
+      handleMenuTap(px,py);
+      return;
+    }
+    if (state === 'gameover'){
+      // FEATURE: clipRecorder -- let them grab the clip before replaying
+      if (clipBtn && inRect(px,py,clipBtn)){ saveClip(); clipReady = false; return; }
+      resetGame();
+      return;
+    }
+    if (inRect(px,py,BTN_PAUSE)){ togglePause(); return; }
+    if (inRect(px,py,BTN_MUTE)){ toggleMute(); return; }
+    // FEATURE: clipRecorder -- must be checked before the aim gesture
+    if (clipBtn && inRect(px,py,clipBtn)){ saveClip(); clipReady = false; return; }
+    if (state !== 'playing') return;
+
+    // Mid-volley the screen is not used for aiming, so a double-tap there is a
+    // free gesture: cycle the speed manually instead of waiting for the auto ramp.
+    if (firing || balls.length){
+      const now = tAccum;
+      if (lastTapAt > 0 && (now - lastTapAt) < 0.35){
+        manualMult = manualMult >= 4 ? 1 : (manualMult === 0 ? 2 : manualMult + 1);
+        lastTapAt = -1;
+        sfx.launch();
+      } else {
+        lastTapAt = now;
+      }
+      return;
+    }
+    aiming = true;
+    pointerPos = {x:px,y:py};
+    aimDir = computeAim(px,py);
+  }
+  function pointerMove(px,py){
+    if (!aiming) return;
+    pointerPos = {x:px,y:py};
+    aimDir = computeAim(px,py);
+  }
+  function pointerUp(){
+    if (!aiming) return;
+    aiming = false;
+    if (aimDir){
+      startFiring();
+    }
+  }
+
+  canvas.addEventListener('pointerdown', e=>{
+    const p = toLogical(e.clientX, e.clientY);
+    pointerDown(p.x, p.y);
+  });
+  canvas.addEventListener('pointermove', e=>{
+    const p = toLogical(e.clientX, e.clientY);
+    pointerMove(p.x, p.y);
+  });
+  window.addEventListener('pointerup', e=>{
+    pointerUp();
+  });
+
+  function togglePause(){
+    if (state === 'playing'){ state = 'paused'; }
+    else if (state === 'paused'){ state = 'playing'; }
+  }
+  function toggleMute(){
+    muted = !muted;
+    localStorage.setItem(LS_MUTE, muted ? '1':'0');
+  }
+
+  // Pause menu button rects (computed at render time relative to overlay box)
+  let menuButtons = {};
+  function handleMenuTap(px,py){
+    if (menuButtons.resume && inRect(px,py,menuButtons.resume)){ state='playing'; return; }
+    if (menuButtons.restart && inRect(px,py,menuButtons.restart)){ resetGame(); return; }
+    if (menuButtons.mute && inRect(px,py,menuButtons.mute)){ toggleMute(); return; }
+    if (menuButtons.speed && inRect(px,py,menuButtons.speed)){
+      speedUpOn = !speedUpOn;
+      localStorage.setItem('endlessBallz_speedup', speedUpOn ? '1':'0');
+      return;
+    }
+  }
+
+  // ---------- Firing ----------
+  function startFiring(){
+    hasShotOnce = true;
+    volleyDestroyed = 0;
+    volleyColumnsCleared = 0;
+    volleyTier = -1;
+    volleyPerfect = false;
+    manualMult = 0;
+    clipReady = false;              // FEATURE: clipRecorder
+    armClip();                      // FEATURE: clipRecorder
+    volleyColStart = new Array(COLS).fill(0);
+    volleyBoardStart = 0;
+    for (const row of rows){
+      for (let c=0;c<COLS;c++) if (row.vals[c] > 0){ volleyColStart[c]++; volleyBoardStart++; }
+    }
+    firing = true;
+    toFire = ballCount;
+    fireTimer = 0;
+    spawnBall();
+    toFire--;
+  }
+  function spawnBall(){
+    balls.push({
+      x: shooterX, y: SHOOT_Y - 1,
+      vx: aimDir.x * SPEED, vy: aimDir.y * SPEED,
+      trail: []
+    });
+    sfx.launch();
+  }
+
+  // ---------- Update ----------
+  let landedXs = [];
+
+  // One physics step. Called repeatedly per frame when fast-forwarding, so the
+  // collision math is identical at every speed -- no tunnelling through blocks.
+  function stepPhysics(dt, gravity){
+    for (let i=balls.length-1; i>=0; i--){
+      const b = balls[i];
+
+      if (gravity) b.vy += gravity*dt;
+
+      b.x += b.vx*dt;
+      b.y += b.vy*dt;
+      b.noHit = (b.noHit||0) + dt;
+
+      // FEATURE: ballTrails -- remember where it just was
+      if (FEATURES.ballTrails){
+        if (!b.trail) b.trail = [];
+        b.trail.push(b.x, b.y);
+        if (b.trail.length > TRAIL_SAMPLES*2) b.trail.splice(0, b.trail.length - TRAIL_SAMPLES*2);
+      }
+
+      // walls
+      let hitWall = false;
+      if (b.x - BALL_R < 0){ b.x = BALL_R; b.vx = Math.abs(b.vx); hitWall = true; sfx.wall(); }
+      else if (b.x + BALL_R > LW){ b.x = LW-BALL_R; b.vx = -Math.abs(b.vx); hitWall = true; sfx.wall(); }
+      // ceiling
+      if (b.y - BALL_R < TOP_Y){ b.y = TOP_Y+BALL_R; b.vy = Math.abs(b.vy); sfx.wall(); }
+
+      // Creeping into a side wall almost vertically parks the ball flat against it,
+      // bouncing straight up and down -- the one place a true straight line belongs.
+      // Silent on purpose: this is just physics, not an achievement. The payoff is
+      // the column it drills out, which shows up in the combo celebration instead.
+      if (hitWall && b.vy !== 0 && Math.abs(b.vx) <= WALL_PARK_TOL*Math.abs(b.vy)){
+        b.vx = 0;
+        b.vy = Math.sign(b.vy) * SPEED;
+        snapCount++;
+      }
+
+      // A perfectly horizontal ball with nothing left in its row would run the
+      // walls forever, so nudge it off-axis if it goes too long without a hit.
+      if (b.vy === 0 && b.noHit > 2.2){
+        b.vy = SPEED*0.18;
+        b.vx = Math.sign(b.vx) * SPEED*0.98;
+      }
+
+      // block collisions
+      let collided = false;
+      for (let r = rows.length-1; r>=0 && !collided; r--){
+        const ry = rowY(r);
+        if (ry > b.y + BALL_R + BS) continue;
+        if (ry < b.y - BALL_R - BS) continue;
+        const row = rows[r];
+        for (let c=0;c<COLS;c++){
+          const v = row.vals[c];
+          if (v === 0) continue;
+          const rect = {x:c*BS, y:ry, w:BS, h:BS};
+          const hit = circleRectCollide(b.x,b.y,BALL_R,rect);
+          if (hit){
+            if (v === -1){
+              // bonus ball pickup - pass straight through it
+              row.vals[c] = 0;
+              ballCount++;
+              sfx.pickup();
+              addFloater(rect.x+BS/2, rect.y+BS/2, '+1 ball', '#ffd54a');
+              continue;
+            }
+
+            b.noHit = 0;
+
+            // A true corner clip: the nearest point on the block is a corner,
+            // so the ball is diagonally outside it on both axes.
+            const corner = Math.abs(hit.dx) > 0.001 && Math.abs(hit.dy) > 0.001;
+            // A ball that is already running perfectly straight keeps its line
+            // through corners (that is what lets it drill a whole column), but
+            // that is not a NEW piece of luck, so it does not re-announce itself.
+            const alreadyStraight = (b.vx === 0 || b.vy === 0);
+            // Only lock a corner clip into a perfect line when the ball is already
+            // pinned against a side wall. Mid-board near-vertical clips are left
+            // alone so they keep drifting and eventually wander off a corner.
+            const againstWall = (b.x - BALL_R <= WALL_HUG_DIST) ||
+                                (LW - b.x - BALL_R <= WALL_HUG_DIST);
+            let snapped = false;
+            if (corner && CORNER_SNAP_TOL > 0){
+              const ax = Math.abs(b.vx), ay = Math.abs(b.vy);
+              if (againstWall && ax <= CORNER_SNAP_TOL*ay){
+                // near-vertical clip while hugging a wall -> park it vertical
+                b.vx = 0;
+                b.vy = (hit.dy >= 0 ? 1 : -1) * SPEED;
+                snapped = true;
+              } else if (ALLOW_SIDEWINDER && ay <= CORNER_SNAP_TOL*ax){
+                b.vy = 0;
+                b.vx = (hit.dx >= 0 ? 1 : -1) * SPEED;
+                snapped = true;
+              } else if (alreadyStraight && ax === 0){
+                // an already-parked vertical ball keeps its line through corners,
+                // which is what lets it drill the whole column out
+                b.vy = (hit.dy >= 0 ? 1 : -1) * SPEED;
+                snapped = true;
+              }
+              if (snapped && !alreadyStraight) snapCount++;
+            }
+            if (!snapped){
+              if (corner){
+                // True corner bounce: reflect about the corner->centre normal.
+                // Flat faces send a ball back predictably, but a corner can spit
+                // it off at almost any angle -- this is where the chaos that makes
+                // a big cascade possible actually comes from.
+                const len = Math.hypot(hit.dx, hit.dy) || 1;
+                const nx = hit.dx/len, ny = hit.dy/len;
+                const dot = b.vx*nx + b.vy*ny;
+                if (dot < 0){
+                  b.vx -= 2*dot*nx;
+                  b.vy -= 2*dot*ny;
+                  // keep the speed constant so corners never bleed energy
+                  const sp = Math.hypot(b.vx,b.vy) || 1;
+                  b.vx = b.vx/sp*SPEED;
+                  b.vy = b.vy/sp*SPEED;
+                } else {
+                  b.vy = hit.dy > 0 ? Math.abs(b.vy) : -Math.abs(b.vy);
+                }
+              } else if (Math.abs(hit.dx) > Math.abs(hit.dy)){
+                b.vx = hit.dx > 0 ? Math.abs(b.vx) : -Math.abs(b.vx);
+              } else {
+                b.vy = hit.dy > 0 ? Math.abs(b.vy) : -Math.abs(b.vy);
+              }
+            }
+
+            row.vals[c] = v - 1;
+            score++;
+            sfx.hit();
+            // No separate sound on destruction on purpose -- a ding here fights
+            // the impact sound, which is the satisfying part.
+            if (row.vals[c] === 0){
+              onBlockDestroyed(rect.x+BS/2, rect.y+BS/2, c);
+            }
+            collided = true;
+            break;
+          }
+        }
+      }
+
+      // floor -> landed
+      if (b.y - BALL_R > FLOOR_Y){
+        landedXs.push(b.x);
+        balls.splice(i,1);
+      }
+    }
+  }
+
+  function circleRectCollide(cx,cy,r,rect){
+    const nx = Math.max(rect.x, Math.min(cx, rect.x+rect.w));
+    const ny = Math.max(rect.y, Math.min(cy, rect.y+rect.h));
+    const dx = cx-nx, dy = cy-ny;
+    if (dx*dx+dy*dy <= r*r){
+      return {nx, ny, dx, dy};
+    }
+    return null;
+  }
+
+  function addFloater(x,y,text,color){
+    floaters.push({x,y,text,color,life:0.8,maxLife:0.8});
+  }
+
+  // Higher priority wins: a modest column clear must never stomp the banner from
+  // a bigger moment that is still on screen.
+  function showBanner(text, sub, color, life, big, prio){
+    prio = prio || 0;
+    if (banner && banner.life > 0 && banner.prio > prio) return;
+    banner = { text, sub, color, life, maxLife: life, big: !!big, prio };
+  }
+  function addRing(x,y,color,max,delay){
+    rings.push({x,y,r:8,max:max||220,life:0.7,maxLife:0.7,color,delay:delay||0});
+  }
+  function blocksOnBoard(){
+    let n = 0;
+    for (const row of rows) for (const v of row.vals) if (v > 0) n++;
+    return n;
+  }
+
+  // ==== FEATURE: dangerZone =================================================
+  // The stack is one row from killing you: the oldest row is sitting in the
+  // final band and still has blocks in it.
+  const DANGER_LINE_Y = ROW_TOP + (MAX_ROWS-1)*BS;
+  function inDanger(){
+    if (!FEATURES.dangerZone) return false;
+    return rows.length >= MAX_ROWS && rows[0] && rows[0].vals.some(v => v > 0);
+  }
+  function nearDanger(){
+    if (!FEATURES.dangerZone) return false;
+    return rows.length >= MAX_ROWS-1 && rows[0] && rows[0].vals.some(v => v > 0);
+  }
+  // ==== END FEATURE: dangerZone ============================================
+
+  // ==== FEATURE: clipRecorder ==============================================
+  function clipSupported(){
+    try {
+      if (!FEATURES.clipRecorder || !window.MediaRecorder) return false;
+      const probe = document.createElement('canvas');
+      return typeof probe.captureStream === 'function';
+    } catch(e){ return false; }
+  }
+  function ensureRecCanvas(){
+    if (recCanvas) return;
+    recCanvas = document.createElement('canvas');
+    recCanvas.width = CLIP_W; recCanvas.height = CLIP_H;
+    recCtx = recCanvas.getContext('2d');
+  }
+  // called once per rendered frame, only while actually recording
+  function mirrorForClip(){
+    if (!recorder || !recCtx) return;
+    try { recCtx.drawImage(canvas, 0, 0, CLIP_W, CLIP_H); } catch(e){}
+  }
+  function pickMime(){
+    // H.264-in-mp4 first: that is what social apps and iOS Photos accept without
+    // complaint. iOS Safari gives H.264 for plain video/mp4 too. WebM is the
+    // last resort for browsers with no mp4 muxer at all.
+    const want = [
+      'video/mp4;codecs=avc1.42E01E',
+      'video/mp4;codecs=avc1',
+      'video/mp4',
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm'
+    ];
+    for (const m of want){
+      try { if (MediaRecorder.isTypeSupported(m)) return m; } catch(e){}
+    }
+    return '';
+  }
+  function armClip(){
+    if (!clipSupported() || ballCount < CLIP_ARM_BALLS) return;
+    try {
+      ensureRecCanvas();
+      if (!recStream) recStream = recCanvas.captureStream(30);
+      if (!recMime) recMime = pickMime();
+      if (!recMime) return;
+      recChunks = [];
+      recKeep = false;
+      recorder = new MediaRecorder(recStream, { mimeType: recMime, videoBitsPerSecond: 3500000 });
+      recorder.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+      recorder.onerror = () => { try { recorder.stop(); } catch(e){} recorder = null; };
+      recorder.onstop = () => {
+        if (recKeep && recChunks.length){
+          try {
+            clipBlob = new Blob(recChunks, { type: recMime });
+            clipSecs = Math.round(tAccum - recStartedAt);
+            clipReady = true;
+            sfx.clip();
+          } catch(e){}
+        }
+        recChunks = [];
+        recorder = null;
+      };
+      recorder.start();
+      recStartedAt = tAccum;
+    } catch(e){ recorder = null; }
+  }
+  function endClip(keep){
+    clipTail = -1;
+    if (!recorder) return;
+    recKeep = !!keep;
+    try { if (recorder.state !== 'inactive') recorder.stop(); } catch(e){ recorder = null; }
+  }
+  function saveClip(){
+    if (!clipBlob) return;
+    const ext = recMime.indexOf('mp4') >= 0 ? 'mp4' : 'webm';
+    const name = 'endless-ballz-' + score + '.' + ext;
+    try {
+      const file = new File([clipBlob], name, { type: recMime });
+      if (navigator.canShare && navigator.canShare({ files: [file] })){
+        navigator.share({ files: [file], title: 'Endless Ballz', text: 'Score ' + score });
+        return;
+      }
+    } catch(e){}
+    try {
+      const url = URL.createObjectURL(clipBlob);
+      const a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 5000);
+    } catch(e){}
+  }
+  // ==== END FEATURE: clipRecorder ==========================================
+  function columnIsEmpty(col){
+    for (const row of rows) if (row.vals[col] > 0) return false;
+    return true;
+  }
+
+  // Called every time a block is destroyed during a volley.
+  function onBlockDestroyed(cx, cy, col){
+    volleyDestroyed++;
+
+    // escalate through the hype tiers as the count climbs
+    for (let t = COMBO_TIERS.length-1; t > volleyTier; t--){
+      if (volleyDestroyed >= COMBO_TIERS[t].n){
+        volleyTier = t;
+        const tier = COMBO_TIERS[t];
+        showBanner(tier.text, volleyDestroyed + ' BLOCKS', tier.color, 1.15, t >= 2, 2);
+        shake = Math.max(shake, tier.shake);
+        flash = { color: tier.color, life: 0.28, maxLife: 0.28 };
+        addRing(cx, cy, tier.color, 160 + t*40);
+        sfx.combo(t);
+        break;
+      }
+    }
+
+    // A whole column wiped out. Only worth shouting about if the column was
+    // actually deep -- clearing a lone block is not an achievement.
+    if (columnIsEmpty(col) && (volleyColStart[col]||0) >= COLUMN_CLEAR_MIN){
+      volleyColumnsCleared++;
+      if (blocksOnBoard() > 0){
+        showBanner('COLUMN CLEARED', volleyColStart[col] + ' DEEP', '#4ad9ff', 1.0, false, 1);
+        shake = Math.max(shake, 5);
+        addRing(cx, cy, '#4ad9ff', 200);
+        sfx.column();
+      }
+    }
+
+    // the big one: nothing left on the board
+    if (blocksOnBoard() === 0){
+      const noun = volleyDestroyed === 1 ? ' BLOCK' : ' BLOCKS';
+      if (volleyBoardStart >= PERFECT_MIN_BOARD){
+        // earned it off a genuinely loaded board -- go all out
+        volleyPerfect = true;
+        showBanner('PERFECT CLEAR!!!', 'BOARD WIPED · ' + volleyDestroyed + noun, '#c86bff', 2.8, true, 3);
+        shake = Math.max(shake, 14);
+        flash = { color: '#ffffff', life: 0.45, maxLife: 0.45 };
+        for (let i=0;i<4;i++) addRing(LW/2, (TOP_Y+FLOOR_Y)/2, i%2 ? '#c86bff' : '#ffd54a', 250 + i*80, i*0.13);
+        slowmo = 1.1; slowmoFactor = 0.35;
+        sfx.perfect();
+      } else {
+        // technically a clear, but the board was nearly empty already
+        showBanner('BOARD CLEAR', volleyDestroyed + noun, '#4ad9ff', 1.2, false, 3);
+        shake = Math.max(shake, 5);
+        addRing(LW/2, (TOP_Y+FLOOR_Y)/2, '#4ad9ff', 240);
+        sfx.column();
+      }
+    }
+  }
+
+  function update(dt){
+    // ==== FEATURE: clipRecorder ============================================
+    // Runs before the state checks on purpose: a run that ends in death still
+    // has to finish writing its clip, and that is often the best clip there is.
+    if (clipTail > 0){
+      clipTail -= dt;
+      if (clipTail <= 0) endClip(true);
+    }
+    if (recorder && (tAccum - recStartedAt) > CLIP_MAX_SECS) endClip(recKeep);
+    // ==== END FEATURE: clipRecorder ========================================
+
+    if (state === 'gameover'){
+      gameOverPulse += dt;
+      return;
+    }
+    if (state !== 'playing') return;
+
+    // fire remaining queued balls
+    if (firing && toFire > 0){
+      fireTimer += dt;
+      while (fireTimer >= FIRE_INTERVAL && toFire > 0){
+        fireTimer -= FIRE_INTERVAL;
+        spawnBall();
+        toFire--;
+      }
+    }
+
+    // ---- fast-forward: run extra physics steps once a volley drags on ----
+    // FEATURE: dangerZone -- hold off the ramp while the board is on the brink,
+    // because that is exactly when the player wants to watch.
+    const dangerStretch = inDanger() ? 1.75 : 1;
+    let mult = 1;
+    if (firing || balls.length){
+      roundClock += dt;
+      if (manualMult > 0){
+        mult = manualMult;              // player took control with a double-tap
+      } else if (speedUpOn){
+        if (roundClock > SPEEDUP_4X*dangerStretch) mult = 4;
+        else if (roundClock > SPEEDUP_3X*dangerStretch) mult = 3;
+        else if (roundClock > SPEEDUP_2X*dangerStretch) mult = 2;
+      }
+    } else {
+      roundClock = 0;
+    }
+
+    // a big moment briefly drops into slow motion so it lands
+    let stepDt = dt;
+    if (slowmo > 0){
+      slowmo = Math.max(0, slowmo - dt);
+      mult = 1;
+      stepDt = dt * slowmoFactor;
+    }
+    speedMult = mult;
+
+    const gravity = (roundClock > STALL_GRAVITY_AFTER) ? STALL_GRAVITY : 0;
+    for (let s=0; s<mult; s++) stepPhysics(stepDt, gravity);
+
+    // celebration effect timers
+    if (shake > 0) shake = Math.max(0, shake - dt*22);
+    if (banner){
+      banner.life -= dt;
+      if (banner.life <= 0) banner = null;
+    }
+    if (flash){
+      flash.life -= dt;
+      if (flash.life <= 0) flash = null;
+    }
+    for (let i=rings.length-1;i>=0;i--){
+      const g = rings[i];
+      if (g.delay > 0){ g.delay -= dt; continue; }   // staggered start
+      g.life -= dt;
+      g.r += (g.max - g.r) * Math.min(1, dt*6);
+      if (g.life <= 0) rings.splice(i,1);
+    }
+
+    // ==== FEATURE: scoreTicker ==============================================
+    if (FEATURES.scoreTicker){
+      if (scoreShown < score){
+        const gap = score - scoreShown;
+        scoreShown = Math.min(score, scoreShown + Math.max(14, gap*4.5) * dt);
+      } else scoreShown = score;
+    } else scoreShown = score;
+    // ==== END FEATURE: scoreTicker =========================================
+
+    // ==== FEATURE: dangerZone ==============================================
+    if (inDanger()){
+      dangerBeat -= dt;
+      if (dangerBeat <= 0){ sfx.heartbeat(); dangerBeat = 1.15; }
+    } else dangerBeat = 0;
+    // ==== END FEATURE: dangerZone ==========================================
+
+    // ==== FEATURE: lastStand ===============================================
+    if (FEATURES.lastStand){
+      const oneLeft = (firing || balls.length > 0) && blocksOnBoard() === 1;
+      if (oneLeft && !lastStandOn){
+        lastStandOn = true;
+        // brief hitch the first time it happens, so the cliffhanger registers
+        if (balls.length <= 3){ slowmo = Math.max(slowmo, 0.7); slowmoFactor = 0.55; }
+      } else if (!oneLeft){
+        lastStandOn = false;
+      }
+      if (lastStandOn){
+        lastStandTick -= dt;
+        if (lastStandTick <= 0){ sfx.tick(); lastStandTick = 0.42; }
+      }
+    }
+    // ==== END FEATURE: lastStand ===========================================
+
+
+    // round finished?
+    if (firing && toFire === 0 && balls.length === 0){
+      firing = false;
+      // FEATURE: clipRecorder -- was this volley worth keeping?
+      if (recorder){
+        if (volleyTier >= CLIP_MIN_TIER || volleyPerfect) clipTail = CLIP_TAIL;
+        else endClip(false);
+      }
+      if (landedXs.length){
+        shooterX = landedXs[landedXs.length-1];
+        shooterX = Math.max(BS*0.5, Math.min(LW-BS*0.5, shooterX));
+      }
+      landedXs = [];
+      sfx.row();
+      newRow();
+      if (state === 'playing'){
+        addFloater(shooterX, SHOOT_Y - 26, '+1 ball', '#ffd54a');
+      }
+    }
+
+    // row spawn fade-in timers
+    for (const row of rows){
+      if (row.spawn != null && row.spawn < 1) row.spawn += dt;
+    }
+
+    for (let i=floaters.length-1;i>=0;i--){
+      const f = floaters[i];
+      f.life -= dt;
+      f.y -= 22*dt;
+      if (f.life<=0) floaters.splice(i,1);
+    }
+  }
+
+  // ---------- Render ----------
+  function roundRect(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+  }
+
+  function drawBlock(x,y,w,h,v,base){
+    const col = valueColor(v, base);
+    ctx.save();
+    ctx.shadowColor = col.glow;
+    ctx.shadowBlur = 8;
+    roundRect(x+3,y+3,w-6,h-6,8);
+    ctx.fillStyle = col.fill;
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = col.border;
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = '#fff';
+    const s = String(v);
+    const fs = s.length >= 4 ? 15 : (s.length === 3 ? 18 : 22);
+    ctx.font = '600 ' + fs + 'px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(s, x+w/2, y+h/2+1);
+  }
+
+  function drawPickup(x,y,w,h,t){
+    const cx = x+w/2, cy = y+h/2;
+    const pulse = 3*Math.sin(t*4);
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,255,255,0.9)';
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.arc(cx,cy, 9+pulse*0.4, 0, Math.PI*2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    ctx.restore();
+    ctx.beginPath();
+    ctx.arc(cx,cy, 15, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  let tAccum = 0;
+
+  function draw(){
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.scale(scale, scale);
+    ctx.clearRect(0,0,LW,LH);
+
+    // background
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,LW,LH);
+
+    // screen shake wraps the whole frame
+    ctx.save();
+    if (shake > 0.05){
+      ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+    }
+
+    // header -- FEATURE: scoreTicker makes this spin up rather than jump
+    const behind = score - scoreShown;
+    const climbing = FEATURES.scoreTicker && behind > 0.6;
+    const shown = FEATURES.scoreTicker ? Math.round(scoreShown) : score;
+    ctx.save();
+    ctx.textAlign = 'center';
+    if (climbing){
+      const pop = 1 + Math.min(0.26, behind/70);
+      const tier = volleyTier >= 0 ? COMBO_TIERS[volleyTier] : null;
+      ctx.translate(LW/2, 66); ctx.scale(pop, pop); ctx.translate(-LW/2, -66);
+      ctx.fillStyle = tier ? tier.color : '#fff';
+      ctx.shadowColor = tier ? tier.color : 'rgba(255,255,255,0.5)';
+      ctx.shadowBlur = Math.min(26, behind/2);
+    } else {
+      ctx.fillStyle = '#fff';
+    }
+    ctx.font = '700 46px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.fillText(String(shown), LW/2, 66);
+    ctx.restore();
+    ctx.textAlign = 'center';
+    ctx.font = '500 14px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText('Best: ' + best, LW/2, 92);
+
+    // live combo counter while a volley is tearing through blocks
+    if (volleyDestroyed >= 3 && (firing || balls.length)){
+      const tier = volleyTier >= 0 ? COMBO_TIERS[volleyTier] : null;
+      ctx.font = '800 20px -apple-system, Helvetica, Arial, sans-serif';
+      ctx.fillStyle = tier ? tier.color : '#ffd54a';
+      ctx.textAlign = 'left';
+      ctx.fillText('×' + volleyDestroyed, 16, 92);
+    }
+
+    // pause button
+    drawIconButton(BTN_PAUSE, 'pause');
+    drawIconButton(BTN_MUTE, muted ? 'mute' : 'sound');
+
+    // fast-forward badge, only while it is actually engaged
+    if (speedMult > 1){
+      const label = speedMult + '×';
+      ctx.font = '700 17px -apple-system, Helvetica, Arial, sans-serif';
+      const tw = ctx.measureText(label).width;
+      const bw = tw + 18, bh = 24;
+      const bx = BTN_PAUSE.x - bw - 12, by = BTN_PAUSE.y + 6;
+      ctx.save();
+      ctx.globalAlpha = 0.75 + 0.25*Math.sin(tAccum*7);
+      roundRect(bx, by, bw, bh, 12);
+      ctx.fillStyle = 'rgba(255,90,32,0.9)';
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, bx+bw/2, by+bh/2+1);
+      ctx.restore();
+    }
+
+    // divider under header
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, TOP_Y); ctx.lineTo(LW, TOP_Y); ctx.stroke();
+    // floor line
+    ctx.beginPath(); ctx.moveTo(0, FLOOR_Y); ctx.lineTo(LW, FLOOR_Y); ctx.stroke();
+
+    // ==== FEATURE: dangerZone -- the death line, and panic when it is crossed
+    if (FEATURES.dangerZone){
+      const danger = inDanger();
+      const warn = nearDanger();
+      ctx.save();
+      if (danger){
+        const p = 0.5 + 0.5*Math.sin(tAccum*6);
+        // hazard band across the doomed row
+        ctx.fillStyle = 'rgba(255,32,32,' + (0.07 + 0.09*p) + ')';
+        ctx.fillRect(0, DANGER_LINE_Y, LW, FLOOR_Y-DANGER_LINE_Y);
+        ctx.strokeStyle = 'rgba(255,60,40,' + (0.55 + 0.45*p) + ')';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([]);
+      } else {
+        ctx.strokeStyle = warn ? 'rgba(255,120,40,0.42)' : 'rgba(255,255,255,0.16)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([7,6]);
+      }
+      ctx.beginPath();
+      ctx.moveTo(0, DANGER_LINE_Y); ctx.lineTo(LW, DANGER_LINE_Y);
+      ctx.stroke();
+      ctx.restore();
+
+      if (danger){
+        // red vignette around the whole play field
+        const p = 0.5 + 0.5*Math.sin(tAccum*6);
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,40,30,' + (0.25 + 0.35*p) + ')';
+        ctx.lineWidth = 10;
+        ctx.strokeRect(5, TOP_Y+5, LW-10, FLOOR_Y-TOP_Y-10);
+        ctx.restore();
+        ctx.save();
+        ctx.font = '800 13px -apple-system, Helvetica, Arial, sans-serif';
+        ctx.textAlign = 'center';
+        const label = 'DANGER', tw2 = ctx.measureText(label).width;
+        // dark pill so it stays readable when it lands on top of blocks
+        roundRect(LW/2 - tw2/2 - 9, DANGER_LINE_Y - 20, tw2 + 18, 17, 8);
+        ctx.fillStyle = 'rgba(20,0,0,0.82)';
+        ctx.fill();
+        ctx.fillStyle = 'rgba(255,80,60,' + (0.7 + 0.3*p) + ')';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, LW/2, DANGER_LINE_Y - 11);
+        ctx.textBaseline = 'alphabetic';
+        ctx.restore();
+      }
+    }
+    // ==== END FEATURE: dangerZone ==========================================
+
+    // blocks (newest row fades in as it arrives)
+    for (let r=0;r<rows.length;r++){
+      const row = rows[r];
+      const y = rowY(r);
+      const a = Math.min(1, (row.spawn==null?1:row.spawn) / 0.3);
+      ctx.save();
+      if (a < 1) ctx.globalAlpha = a;
+      for (let c=0;c<COLS;c++){
+        const v = row.vals[c];
+        if (v === 0) continue;
+        const x = c*BS;
+        if (v === -1) drawPickup(x,y,BS,BS,tAccum);
+        else drawBlock(x,y,BS,BS,v,row.base);
+      }
+      ctx.restore();
+    }
+
+
+    // ==== FEATURE: ballTrails ==============================================
+    if (FEATURES.ballTrails){
+      ctx.save();
+      ctx.lineCap = 'round';
+      for (const b of balls){
+        const t = b.trail;
+        if (!t || t.length < 4) continue;
+        for (let i=2;i<t.length;i+=2){
+          const f = i/t.length;                    // 0 = oldest, 1 = newest
+          ctx.strokeStyle = 'rgba(255,255,255,' + (0.30*f*f) + ')';
+          ctx.lineWidth = BALL_R*2*f*0.8;
+          ctx.beginPath();
+          ctx.moveTo(t[i-2], t[i-1]);
+          ctx.lineTo(t[i], t[i+1]);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+    // ==== END FEATURE: ballTrails ==========================================
+
+    // balls
+    ctx.fillStyle = '#fff';
+    for (const b of balls){
+      ctx.save();
+      ctx.shadowColor = 'rgba(255,255,255,0.8)';
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.arc(b.x,b.y,BALL_R,0,Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // ==== FEATURE: lastStand -- spotlight the final block and the last ball ==
+    if (FEATURES.lastStand && lastStandOn){
+      const p = 0.5 + 0.5*Math.sin(tAccum*9);
+      // ring the surviving block
+      outer:
+      for (let r=0;r<rows.length;r++){
+        for (let c=0;c<COLS;c++){
+          if (rows[r].vals[c] > 0){
+            const x = c*BS, y = rowY(r);
+            ctx.save();
+            ctx.strokeStyle = 'rgba(255,220,90,' + (0.5+0.5*p) + ')';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(x+BS/2, y+BS/2, BS*0.62 + 4*p, 0, Math.PI*2);
+            ctx.stroke();
+            ctx.restore();
+            break outer;
+          }
+        }
+      }
+      // halo the last ball in play
+      if (balls.length === 1){
+        const b = balls[0];
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,255,255,' + (0.35+0.35*p) + ')';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, BALL_R + 7 + 3*p, 0, Math.PI*2);
+        ctx.stroke();
+        ctx.restore();
+      }
+      ctx.save();
+      ctx.font = '800 22px -apple-system, Helvetica, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,220,90,' + (0.55+0.45*p) + ')';
+      ctx.fillText('ONE LEFT', LW/2, TOP_Y + 34);
+      ctx.restore();
+    }
+    // ==== END FEATURE: lastStand ===========================================
+
+    // floaters
+    ctx.font = '600 15px -apple-system, Helvetica, Arial, sans-serif';
+    for (const f of floaters){
+      const a = Math.max(0,f.life/f.maxLife);
+      ctx.fillStyle = `rgba(255,213,74,${a})`;
+      ctx.textAlign='center';
+      ctx.fillText(f.text, f.x, f.y);
+    }
+
+    // shooter + aim line
+    if (state === 'playing'){
+      if (aiming && aimDir){
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6,7]);
+        ctx.beginPath();
+        ctx.moveTo(shooterX, SHOOT_Y);
+        ctx.lineTo(shooterX + aimDir.x*700, SHOOT_Y + aimDir.y*700);
+        ctx.stroke();
+        ctx.restore();
+      }
+      if (!firing && balls.length===0){
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,255,255,0.8)';
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.arc(shooterX, SHOOT_Y, BALL_R, 0, Math.PI*2);
+        ctx.fillStyle = '#fff';
+        ctx.fill();
+        ctx.restore();
+        ctx.font = '600 16px -apple-system, Helvetica, Arial, sans-serif';
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'left';
+        ctx.fillText(String(ballCount), shooterX + 12, SHOOT_Y + 5);
+
+        if (!hasShotOnce && !aiming){
+          const pulse = 0.55 + 0.35*Math.sin(tAccum*3);
+          ctx.font = '500 15px -apple-system, Helvetica, Arial, sans-serif';
+          ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+          ctx.textAlign = 'center';
+          ctx.fillText('Drag anywhere to aim, release to shoot', LW/2, SHOOT_Y + 40);
+        }
+      }
+      // hint that a double-tap controls the speed, once a volley is running long
+      if ((firing || balls.length) && roundClock > 6 && manualMult === 0){
+        ctx.font = '500 12px -apple-system, Helvetica, Arial, sans-serif';
+        ctx.fillStyle = 'rgba(255,255,255,0.32)';
+        ctx.textAlign = 'center';
+        ctx.fillText('double-tap to speed up', LW/2, FLOOR_Y + 34);
+      }
+    }
+
+    drawCelebration();
+
+    ctx.restore(); // end screen shake
+
+    // ==== FEATURE: clipRecorder -- offer the clip once the volley settles ====
+    clipBtn = null;
+    if (clipReady && clipBlob && state === 'playing' && !firing && balls.length === 0){
+      const bw = 210, bh = 42, bx = LW/2-bw/2, by = FLOOR_Y + 84;
+      clipBtn = {x:bx, y:by, w:bw, h:bh};
+      const p = 0.5 + 0.5*Math.sin(tAccum*4);
+      ctx.save();
+      ctx.shadowColor = 'rgba(255,90,32,' + (0.4+0.4*p) + ')';
+      ctx.shadowBlur = 18;
+      roundRect(bx, by, bw, bh, 21);
+      ctx.fillStyle = '#ff5a20';
+      ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = '#fff';
+      ctx.font = '700 16px -apple-system, Helvetica, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('SAVE THAT CLIP · ' + clipSecs + 's', bx+bw/2, by+bh/2+1);
+      ctx.textBaseline = 'alphabetic';
+    }
+    // ==== END FEATURE: clipRecorder ========================================
+
+    // pause overlay
+    if (state === 'paused'){
+      drawPauseMenu();
+    }
+    // game over overlay
+    if (state === 'gameover'){
+      drawGameOver();
+    }
+  }
+
+  function drawCelebration(){
+    // expanding rings
+    for (const g of rings){
+      if (g.delay > 0) continue;
+      const a = Math.max(0, g.life/g.maxLife);
+      ctx.save();
+      ctx.globalAlpha = a*0.55;
+      ctx.strokeStyle = g.color;
+      ctx.lineWidth = 3 + 5*a;
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, g.r, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // colour wash over the play field
+    if (flash){
+      const a = Math.max(0, flash.life/flash.maxLife);
+      ctx.save();
+      ctx.globalAlpha = a*0.17;
+      ctx.fillStyle = flash.color;
+      ctx.fillRect(0, TOP_Y, LW, FLOOR_Y-TOP_Y);
+      ctx.restore();
+    }
+
+    if (!banner) return;
+    const t = banner.life/banner.maxLife;          // 1 -> 0
+    const appear = Math.min(1, (1-t)*7);           // quick punch-in
+    const a = t < 0.25 ? t/0.25 : 1;               // fade at the end
+    const sc = banner.big
+      ? (0.6 + 0.4*appear) * (1 + 0.06*Math.sin(tAccum*15))
+      : (0.7 + 0.3*appear);
+    const cy = (TOP_Y + FLOOR_Y)/2 - 40;
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.translate(LW/2, cy);
+    ctx.scale(sc, sc);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    ctx.shadowColor = banner.color;
+    ctx.shadowBlur = banner.big ? 34 : 18;
+    ctx.font = '800 ' + (banner.big ? 40 : 30) + 'px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+    ctx.strokeText(banner.text, 0, 0);
+    ctx.fillStyle = banner.color;
+    ctx.fillText(banner.text, 0, 0);
+
+    if (banner.sub){
+      ctx.shadowBlur = 8;
+      ctx.font = '700 16px -apple-system, Helvetica, Arial, sans-serif';
+      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+      ctx.lineWidth = 4;
+      ctx.strokeText(banner.sub, 0, 34);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(banner.sub, 0, 34);
+    }
+    ctx.restore();
+  }
+
+  function drawIconButton(r, kind){
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(r.x+r.w/2, r.y+r.h/2, r.w/2, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    const cx = r.x+r.w/2, cy = r.y+r.h/2;
+    if (kind === 'pause'){
+      ctx.fillRect(cx-7, cy-8, 5, 16);
+      ctx.fillRect(cx+2, cy-8, 5, 16);
+    } else if (kind === 'sound'){
+      ctx.beginPath();
+      ctx.moveTo(cx-8,cy-4); ctx.lineTo(cx-3,cy-4); ctx.lineTo(cx+4,cy-10);
+      ctx.lineTo(cx+4,cy+10); ctx.lineTo(cx-3,cy+4); ctx.lineTo(cx-8,cy+4);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth=1.6;
+      ctx.beginPath(); ctx.arc(cx+6,cy,7,-0.6,0.6); ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(cx-8,cy-4); ctx.lineTo(cx-3,cy-4); ctx.lineTo(cx+4,cy-10);
+      ctx.lineTo(cx+4,cy+10); ctx.lineTo(cx-3,cy+4); ctx.lineTo(cx-8,cy+4);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#ff5252'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(cx+1,cy-8); ctx.lineTo(cx+11,cy+8); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function panel(x,y,w,h){
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,90,20,0.35)';
+    ctx.shadowBlur = 30;
+    roundRect(x,y,w,h,22);
+    ctx.fillStyle = '#111113';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#ff5a20';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function button(x,y,w,h,label,primary){
+    roundRect(x,y,w,h,26);
+    ctx.fillStyle = primary ? '#ff5a20' : 'rgba(255,255,255,0.1)';
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = '600 18px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, x+w/2, y+h/2+1);
+    return {x,y,w,h};
+  }
+
+  function drawPauseMenu(){
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0,0,LW,LH);
+    const pw = 300, ph = 316, px = LW/2-pw/2, py = LH/2-ph/2;
+    panel(px,py,pw,ph);
+    ctx.fillStyle = '#fff';
+    ctx.font = '700 26px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('Paused', LW/2, py+46);
+
+    menuButtons.mute = button(px+24, py+72, pw-48, 44, muted ? 'Sound: Off' : 'Sound: On', false);
+    menuButtons.speed = button(px+24, py+128, pw-48, 44, speedUpOn ? 'Fast-forward: On' : 'Fast-forward: Off', false);
+    menuButtons.resume = button(px+24, py+184, pw-48, 44, 'Resume', true);
+    menuButtons.restart = button(px+24, py+240, pw-48, 44, 'Restart', false);
+  }
+
+  function drawGameOver(){
+    ctx.fillStyle = 'rgba(0,0,0,0.72)';
+    ctx.fillRect(0,0,LW,LH);
+    const pw = 320, ph = 280, px = LW/2-pw/2, py = LH/2-ph/2;
+    panel(px,py,pw,ph);
+    ctx.fillStyle = '#fff';
+    ctx.font = '700 28px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Game Over', LW/2, py+50);
+    ctx.font = '500 15px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText('Score', LW/2, py+90);
+    ctx.font = '700 44px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.fillStyle = '#ff5a20';
+    ctx.fillText(String(score), LW/2, py+134);
+    ctx.font = '500 14px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('Best: ' + best, LW/2, py+156);
+
+    const bw = pw-48, bh=46;
+    const bx = px+24, by = py+ph-70;
+    button(bx,by,bw,bh,'Tap to Play Again', true);
+
+    // FEATURE: clipRecorder -- last chance to keep the clip from this run
+    clipBtn = null;
+    if (clipReady && clipBlob){
+      const cy2 = py + ph + 16;
+      clipBtn = {x:px+24, y:cy2, w:bw, h:42};
+      ctx.save();
+      ctx.shadowColor = 'rgba(255,90,32,0.5)';
+      ctx.shadowBlur = 16;
+      roundRect(clipBtn.x, clipBtn.y, clipBtn.w, clipBtn.h, 21);
+      ctx.fillStyle = '#ff5a20';
+      ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = '#fff';
+      ctx.font = '700 16px -apple-system, Helvetica, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('SAVE THAT CLIP · ' + clipSecs + 's', clipBtn.x+clipBtn.w/2, clipBtn.y+21);
+      ctx.textBaseline = 'alphabetic';
+    }
+  }
+
+  // ---------- Main loop ----------
+  let last = 0;
+  function frame(ts){
+    if (!last) last = ts;
+    let dt = (ts-last)/1000;
+    last = ts;
+    if (dt > 0.05) dt = 0.05;
+    tAccum += dt;
+    update(dt);
+    draw();
+    mirrorForClip();          // FEATURE: clipRecorder
+    requestAnimationFrame(frame);
+  }
+
+  resetGame();
+  requestAnimationFrame(frame);
+
+
+
+})();
+</script>
+</body>
+</html>
